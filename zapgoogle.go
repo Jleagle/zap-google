@@ -10,7 +10,7 @@ import (
 )
 
 //goland:noinspection GoUnusedExportedFunction
-func NewCore(projectID string, clientOps []option.ClientOption, loggerOps []logging.LoggerOption) (zapcore.Core, error) {
+func NewCore(projectID string, sync bool, clientOps []option.ClientOption, loggerOps []logging.LoggerOption) (zapcore.Core, error) {
 
 	ctx := context.Background()
 
@@ -23,7 +23,7 @@ func NewCore(projectID string, clientOps []option.ClientOption, loggerOps []logg
 		client:    googleClient,
 		context:   ctx,
 		loggers:   map[string]*logging.Logger{},
-		async:     true,
+		sync:      sync,
 		loggerOps: loggerOps,
 
 		encoder: zapcore.NewConsoleEncoder(googleEncoderConfig()),
@@ -37,7 +37,7 @@ type googleCore struct {
 	client    *logging.Client
 	context   context.Context
 	loggers   map[string]*logging.Logger
-	async     bool
+	sync      bool
 	loggerOps []logging.LoggerOption
 
 	encoder zapcore.Encoder
@@ -50,7 +50,7 @@ func (g *googleCore) clone() *googleCore {
 		client:  g.client,
 		context: g.context,
 		loggers: g.loggers,
-		async:   g.async,
+		sync:    g.sync,
 
 		encoder: g.encoder.Clone(),
 		output:  g.output,
@@ -125,13 +125,13 @@ func (g googleCore) Write(entry zapcore.Entry, fields []zapcore.Field) error {
 
 	logger := g.getLogger(entry.LoggerName)
 
-	if g.async {
-		logger.Log(googleEntry)
-	} else {
-		err = logger.LogSync(g.context, googleEntry)
+	if g.sync {
+		return logger.LogSync(g.context, googleEntry)
 	}
 
-	return err
+	logger.Log(googleEntry)
+
+	return nil
 }
 
 func (g googleCore) Sync() error {
