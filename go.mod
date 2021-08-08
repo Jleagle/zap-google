@@ -1,4 +1,4 @@
-module github.com/Jleagle/zapgoogle
+module github.com/Jleagle/zap-google
 
 go 1.16
 
