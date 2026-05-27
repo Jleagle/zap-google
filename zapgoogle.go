@@ -2,7 +2,9 @@ package zapgoogle
 
 import (
 	"context"
+	"encoding/json"
 	"io"
+	"sync"
 
 	"cloud.google.com/go/logging"
 	"go.uber.org/zap/zapcore"
@@ -10,7 +12,7 @@ import (
 )
 
 //goland:noinspection GoUnusedExportedFunction
-func NewCore(projectID string, sync bool, clientOps []option.ClientOption, loggerOps []logging.LoggerOption) (zapcore.Core, error) {
+func NewCore(projectID string, synchronous bool, clientOps []option.ClientOption, loggerOps []logging.LoggerOption) (zapcore.Core, error) {
 
 	ctx := context.Background()
 
@@ -19,26 +21,32 @@ func NewCore(projectID string, sync bool, clientOps []option.ClientOption, logge
 		return nil, err
 	}
 
-	core := googleCore{
-		client:    googleClient,
-		context:   ctx,
-		loggers:   map[string]*logging.Logger{},
-		sync:      sync,
-		loggerOps: loggerOps,
+	return NewCoreWithClient(googleClient, synchronous, loggerOps), nil
+}
 
-		encoder: zapcore.NewConsoleEncoder(googleEncoderConfig()),
+//goland:noinspection GoUnusedExportedFunction
+func NewCoreWithClient(client *logging.Client, synchronous bool, loggerOps []logging.LoggerOption) zapcore.Core {
+
+	return &googleCore{
+		client:      client,
+		context:     context.Background(),
+		loggers:     map[string]*logging.Logger{},
+		synchronous: synchronous,
+		loggerOps:   loggerOps,
+		mu:          &sync.RWMutex{},
+
+		encoder: zapcore.NewJSONEncoder(googleEncoderConfig()),
 		output:  zapcore.AddSync(io.Discard),
 	}
-
-	return core, nil
 }
 
 type googleCore struct {
-	client    *logging.Client
-	context   context.Context
-	loggers   map[string]*logging.Logger
-	sync      bool
-	loggerOps []logging.LoggerOption
+	client      *logging.Client
+	context     context.Context
+	loggers     map[string]*logging.Logger
+	synchronous bool
+	loggerOps   []logging.LoggerOption
+	mu          *sync.RWMutex
 
 	encoder zapcore.Encoder
 	output  zapcore.WriteSyncer
@@ -47,10 +55,11 @@ type googleCore struct {
 func (g *googleCore) clone() *googleCore {
 
 	return &googleCore{
-		client:  g.client,
-		context: g.context,
-		loggers: g.loggers,
-		sync:    g.sync,
+		client:      g.client,
+		context:     g.context,
+		loggers:     g.loggers,
+		synchronous: g.synchronous,
+		mu:          g.mu,
 
 		encoder: g.encoder.Clone(),
 		output:  g.output,
@@ -59,7 +68,18 @@ func (g *googleCore) clone() *googleCore {
 
 func (g *googleCore) getLogger(name string) *logging.Logger {
 
-	if val, ok := g.loggers[name]; ok {
+	g.mu.RLock()
+	val, ok := g.loggers[name]
+	g.mu.RUnlock()
+	if ok {
+		return val
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Double check
+	if val, ok = g.loggers[name]; ok {
 		return val
 	}
 
@@ -68,11 +88,11 @@ func (g *googleCore) getLogger(name string) *logging.Logger {
 	return g.loggers[name]
 }
 
-func (g googleCore) Enabled(level zapcore.Level) bool {
-	return level.Enabled(level)
+func (g *googleCore) Enabled(level zapcore.Level) bool {
+	return true
 }
 
-func (g googleCore) With(fields []zapcore.Field) zapcore.Core {
+func (g *googleCore) With(fields []zapcore.Field) zapcore.Core {
 
 	clone := g.clone()
 	for k := range fields {
@@ -81,19 +101,23 @@ func (g googleCore) With(fields []zapcore.Field) zapcore.Core {
 	return clone
 }
 
-func (g googleCore) Check(entry zapcore.Entry, checkedEntry *zapcore.CheckedEntry) *zapcore.CheckedEntry {
-
-	if g.Enabled(entry.Level) {
-		return checkedEntry.AddCore(entry, g)
-	}
-	return checkedEntry
+func (g *googleCore) Check(entry zapcore.Entry, checkedEntry *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+	return checkedEntry.AddCore(entry, g)
 }
 
-func (g googleCore) Write(entry zapcore.Entry, fields []zapcore.Field) error {
+func (g *googleCore) Write(entry zapcore.Entry, fields []zapcore.Field) error {
 
 	buf, err := g.encoder.EncodeEntry(entry, fields)
 	if err != nil {
 		return err
+	}
+
+	var payload interface{}
+	var payloadMap map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &payloadMap); err == nil {
+		payload = payloadMap
+	} else {
+		payload = buf.String()
 	}
 
 	var level logging.Severity
@@ -120,12 +144,12 @@ func (g googleCore) Write(entry zapcore.Entry, fields []zapcore.Field) error {
 	googleEntry := logging.Entry{
 		Timestamp: entry.Time,
 		Severity:  level,
-		Payload:   buf.String(),
+		Payload:   payload,
 	}
 
 	logger := g.getLogger(entry.LoggerName)
 
-	if g.sync {
+	if g.synchronous {
 		return logger.LogSync(g.context, googleEntry)
 	}
 
@@ -134,7 +158,7 @@ func (g googleCore) Write(entry zapcore.Entry, fields []zapcore.Field) error {
 	return nil
 }
 
-func (g googleCore) Sync() error {
+func (g *googleCore) Sync() error {
 
 	for _, logger := range g.loggers {
 
@@ -150,32 +174,15 @@ func (g googleCore) Sync() error {
 // https://cloud.google.com/logging/docs/reference/v2/rest/v2/LogEntry
 func googleEncoderConfig() zapcore.EncoderConfig {
 	return zapcore.EncoderConfig{
-		MessageKey:    "textPayload",
-		LevelKey:      "severity",
-		TimeKey:       "timestamp",
-		NameKey:       "logName",
-		CallerKey:     "caller",
-		StacktraceKey: "trace",
-		LineEnding:    zapcore.DefaultLineEnding,
-		EncodeLevel: func(l zapcore.Level, enc zapcore.PrimitiveArrayEncoder) {
-			switch l {
-			case zapcore.DebugLevel:
-				enc.AppendString("DEBUG")
-			case zapcore.InfoLevel:
-				enc.AppendString("INFO")
-			case zapcore.WarnLevel:
-				enc.AppendString("WARNING")
-			case zapcore.ErrorLevel:
-				enc.AppendString("ERROR")
-			case zapcore.DPanicLevel:
-				enc.AppendString("CRITICAL")
-			case zapcore.PanicLevel:
-				enc.AppendString("ALERT")
-			case zapcore.FatalLevel:
-				enc.AppendString("EMERGENCY")
-			}
-		},
-		EncodeTime:     zapcore.ISO8601TimeEncoder,
+		MessageKey:     "message",
+		LevelKey:       "severity",
+		TimeKey:        "timestamp",
+		NameKey:        "logName",
+		CallerKey:      "caller",
+		StacktraceKey:  "trace",
+		LineEnding:     zapcore.DefaultLineEnding,
+		EncodeLevel:    zapcore.CapitalLevelEncoder,
+		EncodeTime:     zapcore.RFC3339TimeEncoder,
 		EncodeDuration: zapcore.SecondsDurationEncoder,
 		EncodeCaller:   zapcore.ShortCallerEncoder,
 	}
