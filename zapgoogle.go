@@ -179,7 +179,7 @@ func googleEncoderConfig() zapcore.EncoderConfig {
 		TimeKey:        "timestamp",
 		NameKey:        "logName",
 		CallerKey:      "caller",
-		StacktraceKey:  "trace",
+		StacktraceKey:  "stack_trace",
 		LineEnding:     zapcore.DefaultLineEnding,
 		EncodeLevel:    zapcore.CapitalLevelEncoder,
 		EncodeTime:     zapcore.RFC3339TimeEncoder,
